@@ -7,8 +7,8 @@ const Runtime = lambda_runtime.Runtime;
 const InvocationRequest = lambda_runtime.InvocationRequest;
 const InvocationResponse = lambda_runtime.InvocationResponse;
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const allocator = gpa.allocator();
+var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+const allocator = arena.allocator();
 
 pub fn myHandler(ir: InvocationRequest) !InvocationResponse {
     _ = ir;
@@ -16,7 +16,8 @@ pub fn myHandler(ir: InvocationRequest) !InvocationResponse {
 }
 
 pub fn main() !void {
-    defer _ = gpa.deinit();
+    defer arena.deinit();
+ 
     var runtime = Runtime.init(allocator);
     defer runtime.deinit();
     try runtime.runHandler(myHandler);
