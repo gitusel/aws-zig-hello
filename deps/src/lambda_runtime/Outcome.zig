@@ -34,13 +34,13 @@ pub fn Outcome(comptime TResult: anytype, comptime TFailure: anytype, comptime T
         pub fn init(types: anytype, args: anytype) Self {
             // Only one arg either TResult, *TResult, TFailure, *TFailure, Outcome, *Outcome
             if ((types.len != args.len) or types.len > 1) {
-                @compileError("no matching constructor for initialization of " ++ @typeName(Self));
+                @compileError("no matching constructor for initialization of " ++ comptime @typeName(Self));
             }
             if (@typeInfo(@TypeOf(types)) != .Struct) {
-                @compileError("Expected tuple or struct argument, found " ++ @typeName(@TypeOf(types)));
+                @compileError("Expected tuple or struct argument, found " ++ comptime @typeName(@TypeOf(types)));
             }
             if (@typeInfo(@TypeOf(args)) != .Struct) {
-                @compileError("Expected tuple or struct argument, found " ++ @typeName(@TypeOf(args)));
+                @compileError("Expected tuple or struct argument, found " ++ comptime @typeName(@TypeOf(args)));
             }
 
             // only one arg in this case
@@ -68,7 +68,7 @@ pub fn Outcome(comptime TResult: anytype, comptime TFailure: anytype, comptime T
             }
 
             // passing Outcome struct - we must pass pointer
-            if (@typeName(*Self) == @typeName(arg_0_type)) { // if error pass the pointer as type
+            if (comptime std.mem.eql(u8, @typeName(*Self), @typeName(arg_0_type))) { // if error pass the pointer as type
 
                 // arg[0].* is Outcome
                 if (args[0].*.isSuccess()) {
@@ -84,7 +84,7 @@ pub fn Outcome(comptime TResult: anytype, comptime TFailure: anytype, comptime T
                 }
             }
 
-            @compileError("no matching constructor for initialization of " ++ @typeName(Self));
+            @compileError("no matching constructor for initialization of " ++ comptime @typeName(Self));
         }
 
         pub fn isSuccess(self: *Self) bool {
@@ -148,7 +148,8 @@ test "Outcome <TResult, TFailure> - calling child destructor" {
     const SBoolOutcome = Outcome(S, bool, "destruct", "");
     var s = SBoolOutcome.init(.{S}, .{S{ .i = 1 }});
     try expect(s.isSuccess());
-    try expect(s.getResult().hello() == 1);
+    var result: S = s.getResult();
+    try expect(result.hello() == 1);
     s.deinit();
     try expect(!s.isSuccess()); // default value false when reinitialized.
     var f = SBoolOutcome.init(.{bool}, .{true});
