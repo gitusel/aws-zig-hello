@@ -17,7 +17,7 @@ pub fn myHandler(ir: InvocationRequest) !InvocationResponse {
 
 pub fn main() !void {
     defer arena.deinit();
- 
+
     var runtime = Runtime.init(allocator);
     defer runtime.deinit();
     try runtime.runHandler(myHandler);
