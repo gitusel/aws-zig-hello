@@ -43,28 +43,18 @@ const INIT_ERROR_ENDPOINT = "{s}/2018-06-01/runtime/init/error";
 const NEXT_ENDPOINT = "{s}/2018-06-01/runtime/invocation/next";
 const RESULT_ENDPOINT = "{s}/2018-06-01/runtime/invocation/";
 
+var post_url: [:0]const u8 = undefined;
+var next_outcome: ?NextOutcome = undefined;
+var response: ?Response = undefined;
+
 allocator: Allocator = undefined,
 strings: ArrayList([:0]const u8) = undefined,
-responses: ArrayList(Response) = undefined,
 logging: Logging = undefined,
 user_agent_header: ?[:0]const u8 = null,
 endpoints: [3][:0]const u8 = undefined,
 curl_handle: ?*cURL.CURL = null,
-next_outcomes: ArrayList(NextOutcome) = undefined,
 
 pub fn deinit(self: *Runtime) void {
-    // remove responses
-    for (self.responses.items) |*item| {
-        item.deinit();
-    }
-    self.responses.deinit();
-
-    // remove next_outcomes
-    for (self.next_outcomes.items) |*item| {
-        item.deinit();
-    }
-    self.next_outcomes.deinit();
-
     // remove strings
     for (self.strings.items) |item| {
         self.allocator.free(item);
@@ -73,6 +63,15 @@ pub fn deinit(self: *Runtime) void {
     if (self.curl_handle) |curl_handle| cURL.curl_easy_cleanup(curl_handle);
 
     self.logging.deinit();
+
+    // remove post_url
+    if (post_url.len > 0) {
+        self.allocator.free(post_url);
+    }
+
+    // deinit last next_outcome
+    deinitPreviousNextOutcome(&next_outcome);
+
     self.* = undefined;
 }
 
@@ -81,9 +80,10 @@ pub fn init(allocator: Allocator) Runtime {
         .allocator = allocator,
         .logging = Logging.init(allocator),
         .strings = ArrayList([:0]const u8).init(allocator),
-        .responses = ArrayList(Response).init(allocator),
-        .next_outcomes = ArrayList(NextOutcome).init(allocator),
     };
+    post_url = "";
+    next_outcome = null;
+    response = null;
     errdefer self.deinit();
     return self;
 }
@@ -115,38 +115,40 @@ pub fn runHandler(self: *Runtime, handler: *const fn (InvocationRequest) anyerro
     const max_retries: usize = 3;
 
     while (retries < max_retries) {
-        var next_outcome = try self.getNext();
-        if (!next_outcome.isSuccess()) {
-            if (next_outcome.getFailure() == ResponseCode.REQUEST_NOT_MADE) {
+        var outcome = try self.getNext();
+        if (!outcome.isSuccess()) {
+            if (outcome.getFailure() == ResponseCode.REQUEST_NOT_MADE) {
                 retries += 1;
                 continue;
             }
-            self.logging.logInfo(LOG_TAG, "HTTP request was not successful. HTTP response code: {d}. Retrying...", .{@enumToInt(next_outcome.getFailure())});
+            self.logging.logInfo(LOG_TAG, "HTTP request was not successful. HTTP response code: {d}. Retrying...", .{@enumToInt(outcome.getFailure())});
             retries += 1;
             continue;
         }
 
         retries = 0; // infinite loop
 
-        const req: InvocationRequest = next_outcome.getResult();
+        const req: InvocationRequest = outcome.getResult();
         self.logging.logInfo(LOG_TAG, "Invoking user handler", .{});
         var res: InvocationResponse = try handler(req);
         self.logging.logInfo(LOG_TAG, "Invoking user handler completed.", .{});
 
         if (res.isSuccess()) {
-            var postOutcome: PostOutcome = try self.postSuccess(req.request_id.?, &res);
-            if (!self.handlePostOutcome(&postOutcome, req.request_id.?)) {
+            var post_outcome: PostOutcome = try self.postSuccess(req.request_id.?, &res);
+            if (!self.handlePostOutcome(&post_outcome, req.request_id.?)) {
                 res.deinit();
                 return; // TODO: implement a better retry strategy
             }
         } else {
-            var postOutcome: PostOutcome = try self.postFailure(req.request_id.?, &res);
-            if (!self.handlePostOutcome(&postOutcome, req.request_id.?)) {
+            var post_outcome: PostOutcome = try self.postFailure(req.request_id.?, &res);
+            if (!self.handlePostOutcome(&post_outcome, req.request_id.?)) {
                 res.deinit();
                 return; // TODO: implement a better retry strategy
             }
         }
         res.deinit();
+        response.?.deinit();
+        response = null;
     }
 
     if (retries == max_retries) {
@@ -163,17 +165,23 @@ fn configureRuntime(self: *Runtime, endpoint: [:0]const u8) !void {
     };
 }
 
+fn deinitPreviousNextOutcome(outcome: *?NextOutcome) void {
+    if (outcome.*) |*o| {
+        o.deinit();
+    }
+}
+
 //
 // Ask lambda for an invocation.
 //
 fn getNext(self: *Runtime) !NextOutcome {
     // we can initialize response
-    var resp: Response = try Response.init(self.allocator, self.logging);
+    response = try Response.init(self.allocator, self.logging);
 
     self.setCurlNextOptions();
 
-    _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_WRITEDATA, &resp);
-    _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_HEADERDATA, &resp);
+    _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_WRITEDATA, &response);
+    _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_HEADERDATA, &response);
 
     var headers: [*c]cURL.curl_slist = null;
     headers = cURL.curl_slist_append(headers, &self.user_agent_header.?.ptr[0]);
@@ -190,65 +198,67 @@ fn getNext(self: *Runtime) !NextOutcome {
     if (curl_code != cURL.CURLE_OK) {
         self.logging.logDebug(LOG_TAG, "CURL returned error code {d} - {s}", .{ curl_code, cURL.curl_easy_strerror(curl_code) });
         self.logging.logError(LOG_TAG, "Failed to get next invocation. No Response from endpoint \"{s}\"", .{self.endpoints[@enumToInt(EndPoints.NEXT)]});
-
-        var nOutcome = NextOutcome.init(.{ResponseCode}, .{ResponseCode.REQUEST_NOT_MADE});
-        try self.next_outcomes.append(nOutcome);
-        try self.responses.append(resp);
-        return nOutcome;
+        deinitPreviousNextOutcome(&next_outcome);
+        next_outcome = NextOutcome.init(.{ResponseCode}, .{ResponseCode.REQUEST_NOT_MADE});
+        response.?.deinit();
+        response = null;
+        return next_outcome.?;
     }
 
     {
         var resp_code: c_long = 0;
         _ = cURL.curl_easy_getinfo(self.curl_handle.?, cURL.CURLINFO_RESPONSE_CODE, &resp_code);
-        resp.setResponseCode(@intToEnum(ResponseCode, resp_code));
+        response.?.setResponseCode(@intToEnum(ResponseCode, resp_code));
     }
 
     {
-        var content_type: [:0]const u8 = undefined;
+        var content_type: [:0]const u8 = "";
         _ = cURL.curl_easy_getinfo(self.curl_handle.?, cURL.CURLINFO_CONTENT_TYPE, &content_type);
-        try resp.setContentType(content_type); // resp.getcontent_type not used after.
+        try response.?.setContentType(content_type); // resp.getcontent_type not used after.
     }
 
-    if (!isSuccess(resp.getResponseCode())) {
-        self.logging.logError(LOG_TAG, "Failed to get next invocation. Http Response code: {d}", .{@enumToInt(resp.getResponseCode())});
-        var nOutcome: NextOutcome = NextOutcome.init(.{ResponseCode}, .{resp.getResponseCode()});
-        try self.next_outcomes.append(nOutcome);
-        try self.responses.append(resp);
-        return nOutcome;
+    if (!isSuccess(response.?.getResponseCode())) {
+        self.logging.logError(LOG_TAG, "Failed to get next invocation. Http Response code: {d}", .{@enumToInt(response.?.getResponseCode())});
+        deinitPreviousNextOutcome(&next_outcome);
+        next_outcome = NextOutcome.init(.{ResponseCode}, .{response.?.getResponseCode()});
+        response.?.deinit();
+        response = null;
+        return next_outcome.?;
     }
 
-    var out: StringBoolOutcome = resp.getHeader(REQUEST_ID_HEADER);
+    var out: StringBoolOutcome = response.?.getHeader(REQUEST_ID_HEADER);
     if (!out.isSuccess()) {
         self.logging.logError(LOG_TAG, "Failed to find header {s} in response", .{REQUEST_ID_HEADER});
-        var nOutcome: NextOutcome = NextOutcome.init(.{ResponseCode}, .{ResponseCode.REQUEST_NOT_MADE});
-        try self.next_outcomes.append(nOutcome);
-        try self.responses.append(resp);
-        return nOutcome;
+        deinitPreviousNextOutcome(&next_outcome);
+        next_outcome = NextOutcome.init(.{ResponseCode}, .{ResponseCode.REQUEST_NOT_MADE});
+        response.?.deinit();
+        response = null;
+        return next_outcome.?;
     }
 
-    var req: InvocationRequest = InvocationRequest{ .payload = resp.getBody(), .request_id = out.getResult() };
+    var req: InvocationRequest = InvocationRequest{ .payload = response.?.getBody(), .request_id = out.getResult() };
 
-    out = resp.getHeader(TRACE_ID_HEADER);
+    out = response.?.getHeader(TRACE_ID_HEADER);
     if (out.isSuccess()) {
         req.xray_trace_id = out.getResult();
     }
 
-    out = resp.getHeader(CLIENT_CONTEXT_HEADER);
+    out = response.?.getHeader(CLIENT_CONTEXT_HEADER);
     if (out.isSuccess()) {
         req.client_context = out.getResult();
     }
 
-    out = resp.getHeader(COGNITO_IDENTITY_HEADER);
+    out = response.?.getHeader(COGNITO_IDENTITY_HEADER);
     if (out.isSuccess()) {
         req.cognito_identity = out.getResult();
     }
 
-    out = resp.getHeader(FUNCTION_ARN_HEADER);
+    out = response.?.getHeader(FUNCTION_ARN_HEADER);
     if (out.isSuccess()) {
         req.function_arn = out.getResult();
     }
 
-    out = resp.getHeader(DEADLINE_MS_HEADER);
+    out = response.?.getHeader(DEADLINE_MS_HEADER);
     if (out.isSuccess()) {
         const deadline_string = out.getResult();
         const ms = std.fmt.parseUnsigned(u64, deadline_string, 10) catch 0;
@@ -258,28 +268,31 @@ fn getNext(self: *Runtime) !NextOutcome {
         self.logging.logInfo(LOG_TAG, "Received payload: {s}\nTime remaining: {d}", .{ req.payload.?, req.getTimeRemaining() });
     }
 
-    var next_outcome: NextOutcome = NextOutcome.init(.{InvocationRequest}, .{req});
-    try self.next_outcomes.append(next_outcome);
-    try self.responses.append(resp);
-    return next_outcome;
+    deinitPreviousNextOutcome(&next_outcome);
+    next_outcome = NextOutcome.init(.{InvocationRequest}, .{req});
+    return next_outcome.?;
 }
 
 //
 // Tells lambda that the function has succeeded.
 //
 fn postSuccess(self: *Runtime, request_id: [:0]const u8, handler_response: *InvocationResponse) !PostOutcome {
-    const url: [:0]const u8 = try allocPrintZ(self.allocator, "{s}{s}/response", .{ self.endpoints[@enumToInt(EndPoints.RESULT)], request_id });
-    try self.strings.append(url);
-    return doPost(self, url, request_id, handler_response);
+    if (post_url.len > 0) {
+        self.allocator.free(post_url);
+    }
+    post_url = try allocPrintZ(self.allocator, "{s}{s}/response", .{ self.endpoints[@enumToInt(EndPoints.RESULT)], request_id });
+    return doPost(self, post_url, request_id, handler_response);
 }
 
 //
 // Tells lambda that the function has failed.
 //
 fn postFailure(self: *Runtime, request_id: [:0]const u8, handler_response: *InvocationResponse) !PostOutcome {
-    const url: [:0]const u8 = try allocPrintZ(self.allocator, "{s}{s}/error", .{ self.endpoints[@enumToInt(EndPoints.RESULT)], request_id });
-    try self.strings.append(url);
-    return doPost(self, url, request_id, handler_response);
+    if (post_url.len > 0) {
+        self.allocator.free(post_url);
+    }
+    post_url = try allocPrintZ(self.allocator, "{s}{s}/error", .{ self.endpoints[@enumToInt(EndPoints.RESULT)], request_id });
+    return doPost(self, post_url, request_id, handler_response);
 }
 
 fn handlePostOutcome(self: *Runtime, outcome: *PostOutcome, request_id: [:0]const u8) bool {
@@ -309,22 +322,24 @@ fn generateAndSaveEndPoints(self: *Runtime, endpoint: [:0]const u8) !void {
 }
 
 // readData -> user_data is ctx Pair struct
-fn readData(buffer: [*c]u8, size: usize, nItems: usize, user_data: ?*anyopaque) callconv(.C) usize {
+fn readData(data: [*c]u8, size: usize, nItems: usize, user_data: ?*anyopaque) callconv(.C) usize {
     const limit: usize = size * nItems;
     var ctx: *Pair = @ptrCast(*Pair, @alignCast(@alignOf(Pair), user_data.?));
+
+    if (ctx.first == null) {
+        return 0; // nothing to read
+    }
 
     var unread: usize = ctx.first.?.len - ctx.second;
     if (0 == unread) {
         return 0; // end of file/read
     }
 
-    var typed_buffer: [*:0]u8 = @intToPtr([*:0]u8, @ptrToInt(buffer));
-
     if (unread <= limit) {
         var i: usize = 0 + ctx.second;
         var j: usize = 0;
         while (j < unread) : (j += 1) {
-            typed_buffer[j] = ctx.first.?[i];
+            data[j] = ctx.first.?[i];
             i += 1;
         }
         ctx.second += unread;
@@ -334,7 +349,7 @@ fn readData(buffer: [*c]u8, size: usize, nItems: usize, user_data: ?*anyopaque) 
     var i: usize = 0 + ctx.second;
     var j: usize = 0;
     while (j < limit) : (j += 1) {
-        typed_buffer[j] = ctx.first.?[i];
+        data[j] = ctx.first.?[i];
         i += 1;
     }
     ctx.second += limit;
@@ -342,39 +357,39 @@ fn readData(buffer: [*c]u8, size: usize, nItems: usize, user_data: ?*anyopaque) 
 }
 
 // writeData -> user_data is Response struct pointer
-fn writeData(ptr: [*c]u8, size: usize, nMemb: usize, user_data: ?*anyopaque) callconv(.C) usize {
-    if (ptr == null) {
+fn writeData(data: [*c]u8, size: usize, nMemb: usize, user_data: ?*anyopaque) callconv(.C) usize {
+    if (data == null) {
         return 0;
     }
 
     var resp: *Response = @ptrCast(*Response, @alignCast(@alignOf(Response), user_data.?));
     assert(size == 1);
 
-    var typed_buffer: [*:0]u8 = @intToPtr([*:0]u8, @ptrToInt(ptr));
-    resp.appendBody(typed_buffer[0..nMemb :0]) catch {
+    resp.appendBody(data[0..nMemb]) catch {
         return 0;
     };
 
-    return nMemb;
+    return size * nMemb;
 }
 
 // writeHeader called header by header when a header is fully loaded
 // writeHeader -> user_data is Response struct pointer
-fn writeHeader(ptr: [*c]u8, size: usize, nMemb: usize, user_data: ?*anyopaque) callconv(.C) usize {
-    if (ptr == null) {
+fn writeHeader(data: [*c]u8, size: usize, nMemb: usize, user_data: ?*anyopaque) callconv(.C) usize {
+    if (data == null) {
         return 0;
     }
 
     var resp: *Response = @ptrCast(*Response, @alignCast(@alignOf(Response), user_data.?));
-    var typed_buffer: [*:0]u8 = @intToPtr([*:0]u8, @ptrToInt(ptr));
-    resp.logging.logDebug(LOG_TAG, "received header: {s}", .{typed_buffer[0..nMemb :0]});
+    assert(size == 1);
+
+    resp.logging.logDebug(LOG_TAG, "received header: {s}", .{data[0..nMemb]});
 
     var i: usize = 0;
     while (i < nMemb) : (i += 1) {
-        if (ptr[i] != ':') {
+        if (data[i] != ':') {
             continue;
         }
-        resp.addHeader(trim(typed_buffer[0..i]), trim(typed_buffer[(i + 1)..nMemb])) catch {
+        resp.addHeader(trim(data[0..i]), trim(data[(i + 1)..nMemb])) catch {
             return 0;
         };
         break;
@@ -388,9 +403,8 @@ fn rtCurlDebugCallback(handle: *cURL.CURL, curl_infotype: cURL.curl_infotype, da
     _ = handle;
     _ = curl_infotype;
     var self: *Runtime = @ptrCast(*Runtime, @alignCast(@alignOf(Runtime), user_data.?));
-    var typed_data: [*:0]u8 = @intToPtr([*:0]u8, @ptrToInt(data));
 
-    self.logging.logDebug(LOG_TAG, "CURL DBG: {s}", .{typed_data[0..size :0]});
+    self.logging.logDebug(LOG_TAG, "CURL DBG: {s}", .{data[0..size]});
 
     return 0;
 }
@@ -443,6 +457,15 @@ fn setCurlPostResultOptions(self: *Runtime) void {
 }
 
 fn doPost(self: *Runtime, url: [:0]const u8, request_id: [:0]const u8, handler_response: *InvocationResponse) !PostOutcome {
+    var local_strings: ArrayList([:0]const u8) = ArrayList([:0]const u8).init(self.allocator);
+    defer {
+        // local strings memory cleanup
+        for (local_strings.items) |item| {
+            self.allocator.free(item);
+        }
+        local_strings.deinit();
+    }
+
     self.setCurlPostResultOptions();
     _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_URL, &url.ptr[0]);
     self.logging.logInfo(LOG_TAG, "Making request to {s}", .{url});
@@ -450,15 +473,12 @@ fn doPost(self: *Runtime, url: [:0]const u8, request_id: [:0]const u8, handler_r
     var headers: [*c]cURL.curl_slist = null;
 
     const content_type: ?[:0]const u8 = handler_response.getContentType();
-    if (content_type == null) {
-        return PostOutcome.init(.{ResponseCode}, .{ResponseCode.REQUEST_NOT_MADE});
-    }
 
-    if (content_type.?.len == 0) {
+    if ((content_type == null) or (content_type.?.len == 0)) {
         headers = cURL.curl_slist_append(headers, "content-type: text/html");
     } else {
         const content_typeBuffer: [:0]const u8 = try allocPrintZ(self.allocator, "content-type: {s}", .{content_type.?});
-        try self.strings.append(content_typeBuffer);
+        try local_strings.append(content_typeBuffer);
         headers = cURL.curl_slist_append(headers, &content_typeBuffer.ptr[0]);
     }
 
@@ -467,19 +487,21 @@ fn doPost(self: *Runtime, url: [:0]const u8, request_id: [:0]const u8, handler_r
     headers = cURL.curl_slist_append(headers, &self.user_agent_header.?.ptr[0]);
 
     const payload: ?[:0]const u8 = handler_response.getPayload();
+    var ctx: Pair = undefined;
+
     if (payload == null) {
-        cURL.curl_slist_free_all(headers);
-        return PostOutcome.init(.{ResponseCode}, .{ResponseCode.REQUEST_NOT_MADE});
+        headers = cURL.curl_slist_append(headers, "content-length: 0");
+        ctx = Pair{ .first = null, .second = 0 };
+    } else {
+        self.logging.logDebug(LOG_TAG, "calculating content length... content-length: {d}", .{payload.?.len});
+        const content_length: [:0]const u8 = try allocPrintZ(self.allocator, "content-length: {d}", .{payload.?.len});
+        try local_strings.append(content_length);
+        headers = cURL.curl_slist_append(headers, &content_length.ptr[0]);
+        ctx = Pair{ .first = payload.?, .second = 0 };
     }
 
-    self.logging.logDebug(LOG_TAG, "calculating content length... content-length: {d}", .{payload.?.len});
-    const content_length: [:0]const u8 = try allocPrintZ(self.allocator, "content-length: {d}", .{payload.?.len});
-    try self.strings.append(content_length);
-    headers = cURL.curl_slist_append(headers, &content_length.ptr[0]);
-
-    var ctx: Pair = Pair{ .first = payload.?, .second = 0 };
     var resp: Response = try Response.init(self.allocator, self.logging);
-
+    defer resp.deinit();
     _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_WRITEDATA, &resp);
     _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_HEADERDATA, &resp);
     _ = cURL.curl_easy_setopt(self.curl_handle.?, cURL.CURLOPT_READDATA, &ctx);
@@ -487,7 +509,6 @@ fn doPost(self: *Runtime, url: [:0]const u8, request_id: [:0]const u8, handler_r
 
     var curl_code: cURL.CURLcode = cURL.curl_easy_perform(self.curl_handle.?); // perform call
     cURL.curl_slist_free_all(headers);
-    try self.responses.append(resp);
 
     if (curl_code != cURL.CURLE_OK) {
         self.logging.logDebug(LOG_TAG, "CURL returned error code {d} - {s}, for invocation {s}", .{ curl_code, cURL.curl_easy_strerror(curl_code), request_id });
@@ -628,6 +649,17 @@ test "Runtime runHandler" {
     try expect(rh == {});
     rh = try r.runHandler(testFailureHandler1); // if AWS_LAMBDA_RUNTIME_API is fully configured, it will call the server
     try expect(rh == {});
+}
+
+test "Runtime deinitPreviousNextOutcome" {
+    const expect = std.testing.expect;
+    var o: ?NextOutcome = null;
+    deinitPreviousNextOutcome(&o);
+    try expect(o == null);
+    o = NextOutcome.init(.{InvocationRequest}, .{InvocationRequest{}});
+    try expect(o.?.isSuccess());
+    deinitPreviousNextOutcome(&o);
+    try expect(!o.?.isSuccess());
 }
 
 fn testSuccessHandler1(ir: InvocationRequest) !InvocationResponse {
