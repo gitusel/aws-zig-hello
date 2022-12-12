@@ -29,7 +29,7 @@ pub fn build(b: *std.build.Builder) void {
         exe.setBuildMode(mode);
         exe.addPackage(aws_pkg);
         exe.linkLibC();
-        exe.addIncludePath(getFullPath("/deps/include/"));
+        exe.addIncludePath(getPath("/deps/include/"));
         addStaticLib(exe, "libbrotlicommon.a");
         addStaticLib(exe, "libbrotlidec.a");
         addStaticLib(exe, "libcrypto.a");
@@ -61,12 +61,18 @@ pub fn build(b: *std.build.Builder) void {
 }
 
 fn thisDir() []const u8 {
-    return std.fs.path.dirname(@src().file) orelse ".";
+    return comptime blk: {
+        const src = @src();
+        const root_dir = std.fs.path.dirname(src.file) orelse ".";
+        break :blk root_dir;
+    };
 }
 
 // from https://zig.news/xq/cool-zig-patterns-paths-in-build-scripts-4p59
-fn getFullPath(comptime path: [:0]const u8) [:0]const u8 {
-    return comptime thisDir() ++ path;
+fn getPath(comptime path: [:0]const u8) [:0]const u8 {
+    return comptime blk: {
+        break :blk thisDir() ++ path;
+    };
 }
 
 fn addStaticLib(libExeObjStep: *LibExeObjStep, staticLibName: [:0]const u8) void {
@@ -79,32 +85,32 @@ fn addStaticLib(libExeObjStep: *LibExeObjStep, staticLibName: [:0]const u8) void
 
 fn addIncludePath(libExeObjStep: *LibExeObjStep) void {
     if (libExeObjStep.target.cpu_arch.?.isAARCH64()) {
-        libExeObjStep.addIncludePath(getFullPath("/deps/include_aarch64/"));
+        libExeObjStep.addIncludePath(getPath("/deps/include_aarch64/"));
     } else {
-        libExeObjStep.addIncludePath(getFullPath("/deps/include_x86_64/"));
+        libExeObjStep.addIncludePath(getPath("/deps/include_x86_64/"));
     }
 }
 
 fn dirExists(path: [:0]const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    var dir = std.fs.cwd().openDir(path, .{}) catch return false;
     dir.close();
     return true;
 }
 
-fn packageBinary(b: *Builder, package_name: [:0]const u8) *RunStep {
-    if (!dirExists(getFullPath("/runtime"))) {
-        std.fs.makeDirAbsolute(getFullPath("/runtime")) catch unreachable;
+fn packageBinary(b: *Builder, package_name: []const u8) *RunStep {
+    if (!dirExists(getPath("/runtime"))) {
+        std.fs.cwd().makeDir(getPath("/runtime")) catch unreachable;
     }
-    const package_path = allocPrint(b.allocator, "{s}/zig-out/bin/{s}", .{ thisDir(), package_name }) catch unreachable;
+    const package_path = allocPrint(b.allocator, "../zig-out/bin/{s}", .{package_name}) catch unreachable;
     var run_pakager: *RunStep = undefined;
 
     if (builtin.os.tag != .windows) {
-        const packager_script = getFullPath("/packaging/packager");
+        const packager_script = "../packaging/packager";
         run_pakager = b.addSystemCommand(&[_][]const u8{ packager_script, package_path });
     } else {
-        const packager_script = getFullPath("/packaging/packager.ps1");
+        const packager_script = "../packaging/packager.ps1";
         run_pakager = b.addSystemCommand(&[_][]const u8{ "powershell", packager_script, package_path });
     }
-    run_pakager.cwd = getFullPath("/runtime");
+    run_pakager.cwd = getPath("/runtime");
     return run_pakager;
 }

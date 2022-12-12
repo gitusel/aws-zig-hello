@@ -1,6 +1,6 @@
 # Intro
 
-Hello World example. Builds tested on MacOS, Linux Ubuntu and Windows 10 using v0.10.0-dev.
+Hello World example. Builds tested on MacOS, Linux Ubuntu and Windows 10 using v0.11.0-dev.
 
 # x86_64
 
