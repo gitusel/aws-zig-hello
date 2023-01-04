@@ -83,14 +83,6 @@ fn addStaticLib(libExeObjStep: *LibExeObjStep, staticLibName: [:0]const u8) void
     }
 }
 
-fn addIncludePath(libExeObjStep: *LibExeObjStep) void {
-    if (libExeObjStep.target.cpu_arch.?.isAARCH64()) {
-        libExeObjStep.addIncludePath(getPath("/deps/include_aarch64/"));
-    } else {
-        libExeObjStep.addIncludePath(getPath("/deps/include_x86_64/"));
-    }
-}
-
 fn dirExists(path: [:0]const u8) bool {
     var dir = std.fs.cwd().openDir(path, .{}) catch return false;
     dir.close();
