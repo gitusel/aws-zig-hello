@@ -1,32 +1,47 @@
 const std = @import("std");
-const Builder = std.build.Builder;
-const LibExeObjStep = std.build.LibExeObjStep;
+const Build = if (@hasDecl(std, "Build")) std.Build else std.build.Builder;
+const OptimizeMode = if (@hasDecl(Build, "standardOptimizeOption")) std.builtin.OptimizeMode else std.builtin.Mode;
+const CompileStep = if (@hasDecl(Build, "standardOptimizeOption")) std.build.CompileStep else std.build.LibExeObjStep;
 const RunStep = std.build.RunStep;
 const Step = std.build.Step;
-const Mode = std.builtin.Mode;
 const allocPrint = std.fmt.allocPrint;
 const CrossTarget = std.zig.CrossTarget;
 const builtin = @import("builtin");
 
-pub fn build(b: *std.build.Builder) void {
+pub fn build(b: *Build) void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
 
-    // Standard release options allow the person running `zig build` to select
+    // Standard optimize options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
-    const mode = b.standardReleaseOptions();
+    const optimize = if (@hasDecl(Build, "standardOptimizeOption")) b.standardOptimizeOption(.{}) else b.standardReleaseOptions();
 
     // adding aws_lambda_runtime
     const aws_pkg = @import("deps/build_lambda_runtime.zig").getBuildPkg(b);
     defer b.allocator.free(aws_pkg.dependencies.?);
 
+    var exe: *CompileStep = undefined;
+
     if (target.cpu_arch != null) {
-        const exe = b.addExecutable("aws-zig-hello", "src/main.zig");
-        exe.setTarget(target);
-        exe.setBuildMode(mode);
+        if (@hasDecl(Build, "standardOptimizeOption")) {
+            exe = b.addExecutable(.{
+                .name = "aws-zig-hello",
+                .root_source_file = .{ .path = "src/main.zig" },
+                .optimize = optimize,
+                .target = target,
+            });
+            if (optimize == .ReleaseSmall) {
+                exe.strip = true;
+            }
+        } else {
+            exe = b.addExecutable("aws-zig-hello", "src/main.zig");
+            exe.setBuildMode(optimize);
+            exe.setTarget(target);
+        }
+
         exe.addPackage(aws_pkg);
         exe.linkLibC();
         exe.addIncludePath(getPath("/deps/include/"));
@@ -38,10 +53,6 @@ pub fn build(b: *std.build.Builder) void {
         addStaticLib(exe, "libnghttp2.a");
         addStaticLib(exe, "libcurl.a");
 
-        if (mode == .ReleaseSmall) {
-            exe.strip = true;
-        }
-
         exe.install();
 
         const pack_exe = packageBinary(b, "aws-zig-hello");
@@ -49,9 +60,18 @@ pub fn build(b: *std.build.Builder) void {
         b.default_step.dependOn(&pack_exe.step);
     }
 
-    const exe_tests = b.addTest("src/main.zig");
-    exe_tests.setTarget(target);
-    exe_tests.setBuildMode(mode);
+    var exe_tests: *CompileStep = undefined;
+    if (@hasDecl(Build, "standardOptimizeOption")) {
+        exe_tests = b.addTest(.{
+            .root_source_file = .{ .path = "src/main.zig" },
+            .target = target,
+            .optimize = optimize,
+        });
+    } else {
+        exe_tests = b.addTest("src/main.zig");
+        exe_tests.setBuildMode(optimize);
+        exe_tests.setTarget(target);
+    }
     exe_tests.addPackage(aws_pkg);
     exe_tests.linkLibC();
     exe_tests.linkSystemLibrary("curl");
@@ -75,11 +95,11 @@ fn getPath(comptime path: [:0]const u8) [:0]const u8 {
     };
 }
 
-fn addStaticLib(libExeObjStep: *LibExeObjStep, staticLibName: [:0]const u8) void {
-    if (libExeObjStep.target.cpu_arch.?.isAARCH64()) {
-        libExeObjStep.addObjectFile(allocPrint(libExeObjStep.builder.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_aarch64", staticLibName }) catch unreachable);
+fn addStaticLib(compileStep: *CompileStep, staticLibName: [:0]const u8) void {
+    if (compileStep.target.cpu_arch.?.isAARCH64()) {
+        compileStep.addObjectFile(allocPrint(compileStep.builder.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_aarch64", staticLibName }) catch unreachable);
     } else {
-        libExeObjStep.addObjectFile(allocPrint(libExeObjStep.builder.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_x86_64", staticLibName }) catch unreachable);
+        compileStep.addObjectFile(allocPrint(compileStep.builder.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_x86_64", staticLibName }) catch unreachable);
     }
 }
 
@@ -89,7 +109,7 @@ fn dirExists(path: [:0]const u8) bool {
     return true;
 }
 
-fn packageBinary(b: *Builder, package_name: []const u8) *RunStep {
+fn packageBinary(b: *Build, package_name: []const u8) *RunStep {
     if (!dirExists(getPath("/runtime"))) {
         std.fs.cwd().makeDir(getPath("/runtime")) catch unreachable;
     }

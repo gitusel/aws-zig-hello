@@ -1,12 +1,12 @@
 const std = @import("std");
-const Builder = std.build.Builder;
+const Build = if (@hasDecl(std, "Build")) std.Build else std.build.Builder;
 const Pkg = std.build.Pkg;
 const Version = std.builtin.Version;
 const Os = std.Target.Os;
 
 const aws_lambda_zig_version = Version{ .major = 0, .minor = 0, .patch = 0 };
 
-pub fn getBuildPkg(b: *Builder) Pkg {
+pub fn getBuildPkg(b: *Build) Pkg {
     return Pkg{
         .name = "aws",
         .source = .{ .path = getPath("/src/aws.zig") },
@@ -14,7 +14,7 @@ pub fn getBuildPkg(b: *Builder) Pkg {
     };
 }
 
-fn getBuildOptionsPkg(b: *Builder) Pkg {
+fn getBuildOptionsPkg(b: *Build) Pkg {
     const build_options_step = std.build.OptionsStep.create(b);
     build_options_step.addOption(Version, "aws_lambda_zig_version", aws_lambda_zig_version);
     return build_options_step.getPackage("build_options");
