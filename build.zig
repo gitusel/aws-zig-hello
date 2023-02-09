@@ -3,7 +3,6 @@ const Build = if (@hasDecl(std, "Build")) std.Build else std.build.Builder;
 const OptimizeMode = if (@hasDecl(Build, "standardOptimizeOption")) std.builtin.OptimizeMode else std.builtin.Mode;
 const CompileStep = if (@hasDecl(Build, "standardOptimizeOption")) std.build.CompileStep else std.build.LibExeObjStep;
 const RunStep = std.build.RunStep;
-const Step = std.build.Step;
 const allocPrint = std.fmt.allocPrint;
 const CrossTarget = std.zig.CrossTarget;
 const builtin = @import("builtin");
@@ -20,8 +19,10 @@ pub fn build(b: *Build) void {
     const optimize = if (@hasDecl(Build, "standardOptimizeOption")) b.standardOptimizeOption(.{}) else b.standardReleaseOptions();
 
     // adding aws_lambda_runtime
-    const aws_pkg = @import("deps/build_lambda_runtime.zig").getBuildPkg(b);
-    defer b.allocator.free(aws_pkg.dependencies.?);
+    const aws_module = @import("deps/build_lambda_runtime.zig").getBuildModule(b);
+    defer if (!@hasDecl(std, "Build")) {
+        b.allocator.free(aws_module.dependencies.?);
+    };
 
     var exe: *CompileStep = undefined;
 
@@ -33,16 +34,18 @@ pub fn build(b: *Build) void {
                 .optimize = optimize,
                 .target = target,
             });
-            if (optimize == .ReleaseSmall) {
-                exe.strip = true;
-            }
+            exe.addModule("aws", aws_module);
         } else {
             exe = b.addExecutable("aws-zig-hello", "src/main.zig");
             exe.setBuildMode(optimize);
             exe.setTarget(target);
+            exe.addPackage(aws_module);
         }
 
-        exe.addPackage(aws_pkg);
+        if (optimize == .ReleaseSmall) {
+            exe.strip = true;
+        }
+
         exe.linkLibC();
         exe.addIncludePath(getPath("/deps/include/"));
         addStaticLib(exe, "libbrotlicommon.a");
@@ -67,12 +70,13 @@ pub fn build(b: *Build) void {
             .target = target,
             .optimize = optimize,
         });
+        exe.addModule("aws", aws_module);
     } else {
         exe_tests = b.addTest("src/main.zig");
         exe_tests.setBuildMode(optimize);
         exe_tests.setTarget(target);
+        exe_tests.addPackage(aws_module);
     }
-    exe_tests.addPackage(aws_pkg);
     exe_tests.linkLibC();
     exe_tests.linkSystemLibrary("curl");
 
