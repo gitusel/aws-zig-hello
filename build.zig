@@ -2,6 +2,7 @@ const std = @import("std");
 const Build = if (@hasDecl(std, "Build")) std.Build else std.build.Builder;
 const OptimizeMode = if (@hasDecl(Build, "standardOptimizeOption")) std.builtin.OptimizeMode else std.builtin.Mode;
 const CompileStep = if (@hasDecl(Build, "standardOptimizeOption")) std.build.CompileStep else std.build.LibExeObjStep;
+const InstallArtifactStep = std.build.InstallArtifactStep;
 const RunStep = std.build.RunStep;
 const allocPrint = std.fmt.allocPrint;
 const CrossTarget = std.zig.CrossTarget;
@@ -48,19 +49,15 @@ pub fn build(b: *Build) void {
 
         exe.linkLibC();
         exe.addIncludePath(getPath("/deps/include/"));
-        addStaticLib(exe, "libbrotlicommon.a");
-        addStaticLib(exe, "libbrotlidec.a");
-        addStaticLib(exe, "libcrypto.a");
-        addStaticLib(exe, "libssl.a");
-        addStaticLib(exe, "libz.a");
-        addStaticLib(exe, "libnghttp2.a");
-        addStaticLib(exe, "libcurl.a");
+        addStaticLib(b, exe, "libbrotlicommon.a");
+        addStaticLib(b, exe, "libbrotlidec.a");
+        addStaticLib(b, exe, "libcrypto.a");
+        addStaticLib(b, exe, "libssl.a");
+        addStaticLib(b, exe, "libz.a");
+        addStaticLib(b, exe, "libnghttp2.a");
+        addStaticLib(b, exe, "libcurl.a");
 
-        exe.install();
-
-        const pack_exe = packageBinary(b, "aws-zig-hello");
-        pack_exe.step.dependOn(&exe.step);
-        b.default_step.dependOn(&pack_exe.step);
+        packageBinary(b, exe);
     }
 
     var exe_tests: *CompileStep = undefined;
@@ -70,7 +67,7 @@ pub fn build(b: *Build) void {
             .target = target,
             .optimize = optimize,
         });
-        exe.addModule("aws", aws_module);
+        exe_tests.addModule("aws", aws_module);
     } else {
         exe_tests = b.addTest("src/main.zig");
         exe_tests.setBuildMode(optimize);
@@ -81,7 +78,12 @@ pub fn build(b: *Build) void {
     exe_tests.linkSystemLibrary("curl");
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&exe_tests.step);
+
+    if (@hasDecl(Build, "addRunArtifact")) {
+        test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    } else {
+        test_step.dependOn(&exe_tests.step);
+    }
 }
 
 fn thisDir() []const u8 {
@@ -99,11 +101,11 @@ fn getPath(comptime path: [:0]const u8) [:0]const u8 {
     };
 }
 
-fn addStaticLib(compileStep: *CompileStep, staticLibName: [:0]const u8) void {
-    if (compileStep.target.cpu_arch.?.isAARCH64()) {
-        compileStep.addObjectFile(allocPrint(compileStep.builder.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_aarch64", staticLibName }) catch unreachable);
+fn addStaticLib(b: *Build, compile_step: *CompileStep, staticLibName: [:0]const u8) void {
+    if (compile_step.target.cpu_arch.?.isAARCH64()) {
+        compile_step.addObjectFile(allocPrint(b.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_aarch64", staticLibName }) catch unreachable);
     } else {
-        compileStep.addObjectFile(allocPrint(compileStep.builder.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_x86_64", staticLibName }) catch unreachable);
+        compile_step.addObjectFile(allocPrint(b.allocator, "{s}/deps/{s}/{s}", .{ thisDir(), "lib_x86_64", staticLibName }) catch unreachable);
     }
 }
 
@@ -113,20 +115,21 @@ fn dirExists(path: [:0]const u8) bool {
     return true;
 }
 
-fn packageBinary(b: *Build, package_name: []const u8) *RunStep {
+fn packageBinary(b: *Build, compile_step: *CompileStep) void {
     if (!dirExists(getPath("/runtime"))) {
         std.fs.cwd().makeDir(getPath("/runtime")) catch unreachable;
     }
-    const package_path = allocPrint(b.allocator, "../zig-out/bin/{s}", .{package_name}) catch unreachable;
-    var run_pakager: *RunStep = undefined;
+    var run_packager: *RunStep = undefined;
+    const package_path = allocPrint(b.allocator, "../zig-out/bin/{s}", .{compile_step.name}) catch unreachable;
 
     if (builtin.os.tag != .windows) {
         const packager_script = "../packaging/packager";
-        run_pakager = b.addSystemCommand(&[_][]const u8{ packager_script, package_path });
+        run_packager = b.addSystemCommand(&[_][]const u8{ packager_script, package_path });
     } else {
         const packager_script = "../packaging/packager.ps1";
-        run_pakager = b.addSystemCommand(&[_][]const u8{ "powershell", packager_script, package_path });
+        run_packager = b.addSystemCommand(&[_][]const u8{ "powershell", packager_script, package_path });
     }
-    run_pakager.cwd = getPath("/runtime");
-    return run_pakager;
+    run_packager.cwd = getPath("/runtime");
+    run_packager.step.dependOn(&InstallArtifactStep.create(b, compile_step).step);
+    b.default_step.dependOn(&run_packager.step);
 }
